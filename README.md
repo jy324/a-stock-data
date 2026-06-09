@@ -4,6 +4,8 @@ A 股全栈数据工具包 — 7 层架构 · 27 个端点 · 13 个数据源 ·
 
 一个自包含的 Skill 文件，把分散在 13 个数据源里的 A 股原始数据整合成 AI 编程助手直接能用的工具集。你不用再背 mootdx 的 K 线参数、东财的 PDF Referer 头、iwencai 的 X-Claw 鉴权——全部封装好了。
 
+> **Package contract 预览（2026-06-09）：** 仓库新增 `src/astock_data/` Python package 骨架，公开稳定 facade `astock_data.AStockDataClient`、`ProviderResult`、`SourceMetadata`、`DataStatus` 和 `Money`。DSA 等宿主应用应依赖这些领域接口，不直接依赖 `EastmoneyClient` 或 SKILL.md 内部函数名。当前 package 已固定 code 过滤和 lookback 裁剪语义；后续会把 SKILL.md 中已验证的 HTTP 端点逐步迁入 provider 实现。
+
 > **V3.2.2 修复（2026-06-03）：** ① **概念板块归属（#18）**——百度 PAE `getrelatedblock` 失效（`ResultCode 10003`）→ 改用东财 `slist` 一次拿全个股所属板块（行业/概念/地域 + BK码 + 涨跌幅 + 龙头股）；② **巨潮公告 orgId（#19）**——硬编码 `gssx0{code}` 导致大量 601xxx 股票查不到公告 → 改为动态查官方映射表 `szse_stock.json`（6198 只股）；③ 修复综合示例对已删函数 `baidu_fund_flow_history` 的调用；④ §4.5/§5.1 加大陆住宅 IP 间歇风控说明。
 >
 > **V3.2（2026-05-30）：** ① **数据源优先级 + 东财防封**——优先用通达信(mootdx)/腾讯（不封 IP），东财仅用于其独有数据，并新增统一节流入口 `em_get()`，所有东财接口内置串行限流（间隔≥1s+随机抖动）+ 会话复用，AI 抄代码即自带防封；② **财联社快讯下线（#14）**——`cls.cn` 旧 API 全面 404，改用东财全球资讯。
@@ -49,6 +51,14 @@ curl -o ~/.claude/skills/a-stock-data/SKILL.md \
 
 # 3. 安装依赖（V3.0 不再需要 akshare）
 pip install mootdx requests pandas stockstats
+```
+
+Python package contract 本地开发：
+
+```bash
+python -m pip install -e .
+python -m pytest
+python -m compileall -q src/astock_data
 ```
 
 启动 Claude Code，说一句「帮我看看 688017 的估值」，自动激活。
@@ -477,4 +487,3 @@ This project provides data access tools only and does not constitute investment 
 **Author:** Simon Lin · TikTok [@simonlin121212](https://www.tiktok.com/@simonlin121212) · Douyin "Simon林" · WeChat Official Account "硅基世纪"
 
 </details>
-

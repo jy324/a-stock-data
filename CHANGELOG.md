@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### 新增
+- 新增 `src/astock_data/` Python package contract，公开 `AStockDataClient` facade、结构化 `ProviderResult`/`SourceMetadata`/`DataStatus`/`Money` 模型和 provider 注入边界。
+
+### 修复
+- package facade 对个股资金历史统一执行 code 过滤和 lookback 裁剪，对解禁事件严格过滤到请求股票代码，避免宿主应用混入全市场记录。
+
 ## v3.2.2 — 2026-06-03
 
 ### 修复（失效接口替换 + 隐藏 Bug）
