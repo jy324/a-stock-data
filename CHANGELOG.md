@@ -4,6 +4,7 @@
 
 ### 新增
 - 新增 `src/astock_data/` Python package contract，公开 `AStockDataClient` facade、结构化 `ProviderResult`/`SourceMetadata`/`DataStatus`/`Money` 模型和 provider 注入边界。
+- 新增 package CI gate，执行 pytest、compileall 和 `pip wheel . --no-deps`，并上传 wheel artifact 作为发布前验证产物。
 
 ### 修复
 - package facade 对个股资金历史统一执行 code 过滤和 lookback 裁剪，对解禁事件严格过滤到请求股票代码，避免宿主应用混入全市场记录。
