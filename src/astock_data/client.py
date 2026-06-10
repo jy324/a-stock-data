@@ -20,6 +20,14 @@ class AStockDataClient:
         self._eastmoney = eastmoney_provider
         self._cninfo = cninfo_provider
 
+    @classmethod
+    def from_defaults(cls) -> "AStockDataClient":
+        """Build a client with the package's built-in HTTP providers."""
+        from .providers.cninfo import CninfoProvider
+        from .providers.eastmoney import EastmoneyProvider
+
+        return cls(eastmoney_provider=EastmoneyProvider(), cninfo_provider=CninfoProvider())
+
     def get_stock_intraday_flow(self, code: str, *, trade_date: str | None = None) -> ProviderResult[list[dict]]:
         return self._call(
             self._eastmoney,

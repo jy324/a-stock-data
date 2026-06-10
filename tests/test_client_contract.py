@@ -63,3 +63,10 @@ def test_unconfigured_provider_returns_structured_unavailable():
 
     assert result.status == "unavailable"
     assert result.coverage["coverage_ratio"] == 0.0
+
+
+def test_from_defaults_builds_configured_eastmoney_provider():
+    client = AStockDataClient.from_defaults()
+
+    assert client._eastmoney.provider_name == "eastmoney"
+    assert client._cninfo.provider_name == "cninfo"
