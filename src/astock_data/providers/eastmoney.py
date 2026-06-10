@@ -15,6 +15,7 @@ from ..models import DataStatus, ProviderResult, SourceMetadata
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+BKZJ_URL = "https://data.eastmoney.com/dataapi/bkzj/getbkzj"
 
 
 class EastmoneyProvider:
@@ -103,42 +104,21 @@ class EastmoneyProvider:
         trade_date: str | None = None,
         limit: int = 10,
     ) -> ProviderResult[list[dict]]:
-        endpoint = "https://push2.eastmoney.com/api/qt/clist/get"
+        endpoint = BKZJ_URL
         safe_limit = max(1, min(int(limit or 10), 50))
         try:
             payload = self._get_json(
                 endpoint,
                 {
-                    "pn": "1",
-                    "pz": str(max(safe_limit, 50)),
-                    "po": "1",
-                    "np": "1",
-                    "fltt": "2",
-                    "invt": "2",
-                    "fs": "m:90+t:2",
-                    "fields": "f2,f3,f4,f12,f13,f14,f62,f104,f105,f128,f136,f140,f141,f207",
+                    "key": "f62",
+                    "code": "m:90 s:4",
                 },
-                referer="https://quote.eastmoney.com/",
+                referer="https://data.eastmoney.com/bkzj/hy.html",
             )
             items = _diff(payload)
             rows = []
             for index, item in enumerate(items[:safe_limit], start=1):
-                net = _to_float(item.get("f62"))
-                rows.append(
-                    {
-                        "rank": index,
-                        "sector_name": item.get("f14") or "",
-                        "sector_type": "industry",
-                        "provider_sector_code": item.get("f12") or "",
-                        "taxonomy": "eastmoney",
-                        "main_net_inflow": {"amount": net, "unit": "CNY"},
-                        "change_pct": _to_float(item.get("f3")),
-                        "up_count": _to_int(item.get("f104")),
-                        "down_count": _to_int(item.get("f105")),
-                        "leader": item.get("f140") or item.get("f128") or "",
-                        "leader_change": _to_float(item.get("f136")),
-                    }
-                )
+                rows.append(_sector_flow_row(index, item))
             return self._result(
                 "sector_flow_ranking",
                 endpoint,
@@ -396,6 +376,22 @@ def _flow_unit_map() -> dict[str, str]:
         "mid_net": "CNY",
         "large_net": "CNY",
         "super_net": "CNY",
+    }
+
+
+def _sector_flow_row(index: int, item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rank": index,
+        "sector_name": item.get("f14") or "",
+        "sector_type": "industry",
+        "provider_sector_code": item.get("f12") or "",
+        "taxonomy": "eastmoney",
+        "main_net_inflow": {"amount": _to_float(item.get("f62")), "unit": "CNY"},
+        "change_pct": _to_float(item.get("f3")),
+        "up_count": _to_int(item.get("f104")),
+        "down_count": _to_int(item.get("f105")),
+        "leader": item.get("f140") or item.get("f128") or "",
+        "leader_change": _to_float(item.get("f136")),
     }
 
 
