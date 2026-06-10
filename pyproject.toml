@@ -18,6 +18,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["src"]
 markers = [
     "network: tests that call live upstream data providers",
 ]
