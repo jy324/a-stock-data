@@ -116,15 +116,19 @@ class EastmoneyProvider:
                 referer="https://data.eastmoney.com/bkzj/hy.html",
             )
             items = _diff(payload)
+            selected_items = items[:safe_limit]
             rows = []
-            for index, item in enumerate(items[:safe_limit], start=1):
+            for index, item in enumerate(selected_items, start=1):
                 rows.append(_sector_flow_row(index, item))
+            warnings = _sector_flow_warnings(selected_items)
             return self._result(
                 "sector_flow_ranking",
                 endpoint,
                 rows,
                 trade_date=trade_date,
                 coverage={"requested_limit": safe_limit, "returned_count": len(rows)},
+                status=DataStatus.PARTIAL if warnings else None,
+                warnings=warnings,
             )
         except Exception as exc:
             return self._unavailable("sector_flow_ranking", endpoint, trade_date, exc)
@@ -287,20 +291,25 @@ class EastmoneyProvider:
         trade_date: str | None,
         unit_map: dict[str, str] | None = None,
         coverage: dict[str, Any] | None = None,
+        status: DataStatus | None = None,
+        warnings: list[str] | None = None,
     ) -> ProviderResult[list[dict]]:
-        status = DataStatus.OK if data else DataStatus.EMPTY
+        result_status = status or (DataStatus.OK if data else DataStatus.EMPTY)
         result_coverage = {"coverage_ratio": 1.0 if data else 0.0}
         if coverage:
             result_coverage.update(coverage)
+        if warnings:
+            result_coverage["warnings"] = warnings
         return ProviderResult(
             data=data,
             meta=SourceMetadata(
                 provider=self.provider_name,
                 capability=capability,
                 endpoint=endpoint,
-                status=status,
+                status=result_status,
                 trade_date=trade_date,
                 unit_map=unit_map or {},
+                warnings=warnings or [],
                 schema_version=self.schema_version,
             ),
             coverage=result_coverage,
@@ -386,13 +395,33 @@ def _sector_flow_row(index: int, item: dict[str, Any]) -> dict[str, Any]:
         "sector_type": "industry",
         "provider_sector_code": item.get("f12") or "",
         "taxonomy": "eastmoney",
-        "main_net_inflow": {"amount": _to_float(item.get("f62")), "unit": "CNY"},
-        "change_pct": _to_float(item.get("f3")),
-        "up_count": _to_int(item.get("f104")),
-        "down_count": _to_int(item.get("f105")),
-        "leader": item.get("f140") or item.get("f128") or "",
-        "leader_change": _to_float(item.get("f136")),
+        "main_net_inflow": {"amount": _to_optional_float(item.get("f62")), "unit": "CNY"},
+        "change_pct": _to_optional_float(item.get("f3")),
+        "up_count": _to_optional_int(item.get("f104")),
+        "down_count": _to_optional_int(item.get("f105")),
+        "leader": item.get("f140") or item.get("f128") or None,
+        "leader_change": _to_optional_float(item.get("f136")),
     }
+
+
+def _sector_flow_warnings(items: list[dict[str, Any]]) -> list[str]:
+    if not items:
+        return []
+    missing_fields = []
+    field_names = {
+        "f3": "change_pct",
+        "f104": "up_count",
+        "f105": "down_count",
+        "f136": "leader_change",
+    }
+    for source_field, output_field in field_names.items():
+        if all(_is_missing(item.get(source_field)) for item in items):
+            missing_fields.append(output_field)
+    if all(_is_missing(item.get("f140")) and _is_missing(item.get("f128")) for item in items):
+        missing_fields.append("leader")
+    if not missing_fields:
+        return []
+    return ["sector_flow_ranking missing upstream fields: " + ", ".join(missing_fields)]
 
 
 def _dragon_tiger_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -448,3 +477,21 @@ def _to_float(value: Any) -> float:
 
 def _to_int(value: Any) -> int:
     return int(_to_float(value))
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if _is_missing(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_optional_int(value: Any) -> int | None:
+    parsed = _to_optional_float(value)
+    return int(parsed) if parsed is not None else None
+
+
+def _is_missing(value: Any) -> bool:
+    return value in (None, "", "-")

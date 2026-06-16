@@ -52,6 +52,31 @@ def test_sector_flow_ranking_normalizes_eastmoney_fields():
     ]
 
 
+def test_sector_flow_ranking_marks_missing_optional_fields_partial():
+    payload = """
+    {
+      "data": {
+        "diff": [
+          {"f12": "BK1033", "f13": 90, "f14": "电池", "f62": 4436057088}
+        ]
+      }
+    }
+    """
+    provider = EastmoneyProvider(min_interval=0)
+
+    with patch("astock_data.providers.eastmoney.urlopen", return_value=FakeResponse(payload)):
+        result = provider.get_sector_flow_ranking(trade_date="2026-06-16", limit=1)
+
+    assert result.status == "partial"
+    assert result.data[0]["main_net_inflow"] == {"amount": 4436057088.0, "unit": "CNY"}
+    assert result.data[0]["change_pct"] is None
+    assert result.data[0]["up_count"] is None
+    assert result.data[0]["down_count"] is None
+    assert result.data[0]["leader"] is None
+    assert result.data[0]["leader_change"] is None
+    assert "missing upstream fields" in result.meta.warnings[0]
+
+
 def test_stock_flow_history_normalizes_klines():
     payload = '{"data":{"klines":["2026-06-09,10,1,2,3,4","2026-06-08,-,-,-,-,-"]}}'
     provider = EastmoneyProvider(min_interval=0)

@@ -152,6 +152,10 @@ def _cninfo_ts_to_date(value: Any) -> str:
 def _date_range(start_date: str | None, end_date: str | None) -> str:
     if start_date and end_date:
         return f"{start_date}~{end_date}"
+    if start_date:
+        return f"{start_date}~"
+    if end_date:
+        return f"~{end_date}"
     return ""
 
 
