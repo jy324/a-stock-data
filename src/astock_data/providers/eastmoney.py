@@ -8,6 +8,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -16,6 +17,7 @@ from ..models import DataStatus, ProviderResult, SourceMetadata
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 BKZJ_URL = "https://data.eastmoney.com/dataapi/bkzj/getbkzj"
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 class EastmoneyProvider:
@@ -24,9 +26,18 @@ class EastmoneyProvider:
     provider_name = "eastmoney"
     schema_version = "v1"
 
-    def __init__(self, *, timeout: float = 15.0, min_interval: float = 1.0):
+    def __init__(
+        self,
+        *,
+        timeout: float = 15.0,
+        min_interval: float = 1.0,
+        max_retries: int = 3,
+        retry_backoff: float = 0.3,
+    ):
         self.timeout = timeout
         self.min_interval = min_interval
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff = max(0.0, float(retry_backoff))
         self._lock = threading.Lock()
         self._last_call = 0.0
 
@@ -260,7 +271,6 @@ class EastmoneyProvider:
         referer: str,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        self._throttle()
         full_url = f"{url}?{urlencode(params)}"
         request = Request(
             full_url,
@@ -271,9 +281,23 @@ class EastmoneyProvider:
                 "Accept": "application/json,text/plain,*/*",
             },
         )
-        with urlopen(request, timeout=timeout or self.timeout) as response:
-            text = response.read().decode("utf-8", errors="replace")
-        return _loads_json_or_jsonp(text)
+        for attempt in range(self.max_retries + 1):
+            self._throttle()
+            try:
+                with urlopen(request, timeout=timeout or self.timeout) as response:
+                    text = response.read().decode("utf-8", errors="replace")
+                return _loads_json_or_jsonp(text)
+            except HTTPError as exc:
+                if exc.code not in RETRYABLE_HTTP_STATUS or attempt >= self.max_retries:
+                    raise
+                if self.retry_backoff:
+                    time.sleep(self.retry_backoff * (2**attempt))
+            except URLError:
+                if attempt >= self.max_retries:
+                    raise
+                if self.retry_backoff:
+                    time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("unreachable retry state")
 
     def _throttle(self) -> None:
         with self._lock:
@@ -440,13 +464,17 @@ def _dragon_tiger_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _lockup_row(row: dict[str, Any]) -> dict[str, Any]:
+    shares = row.get("FREE_SHARES")
+    if _is_missing(shares):
+        shares = row.get("FREE_SHARES_NUM")
     return {
         "code": row.get("SECURITY_CODE") or "",
         "name": row.get("SECURITY_NAME_ABBR") or "",
         "unlock_date": str(row.get("FREE_DATE") or "")[:10],
         "date": str(row.get("FREE_DATE") or "")[:10],
-        "type": row.get("LIMITED_STOCK_TYPE") or "",
-        "shares": _to_float(row.get("FREE_SHARES_NUM")),
+        "type": row.get("FREE_SHARES_TYPE") or row.get("LIMITED_STOCK_TYPE") or "",
+        "shares": _to_float(shares),
+        "able_shares": _to_float(row.get("ABLE_FREE_SHARES")),
         "ratio": _to_float(row.get("FREE_RATIO")),
     }
 
