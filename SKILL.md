@@ -370,6 +370,8 @@ def get_prefix(code: str) -> str:
     c = code.lower()
     if c.startswith(("sh", "sz", "bj")):     # 显式前缀透传（如 sh000001=上证指数 vs sz000001=平安银行）
         return c[:2]
+    if c.startswith("92"):                     # 北交所 920xxx；900xxx B 股仍由下方 9x 走沪市
+        return "bj"
     if c.startswith(("5", "6", "9")):        # 5x=沪 ETF/LOF，6/9=沪个股
         return "sh"
     if c.startswith(("4", "8")):             # 4x/8x=北交所
@@ -518,6 +520,8 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
         low = c.lower()
         if low.startswith(("sh", "sz", "bj")):        # 显式前缀透传，解决 000001 等歧义
             prefixed.append(low)
+        elif c.startswith("92"):                         # 北交所 920xxx；900xxx B 股仍由下方 9x 走沪市
+            prefixed.append(f"bj{c}")
         elif c in SH_INDEX or c.startswith(("5", "6", "9")):
             prefixed.append(f"sh{c}")
         elif c.startswith(("4", "8")):
