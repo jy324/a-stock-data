@@ -6,6 +6,7 @@
 - 新增 `src/astock_data/` Python package contract，公开 `AStockDataClient` facade、结构化 `ProviderResult`/`SourceMetadata`/`DataStatus`/`Money` 模型和 provider 注入边界。
 - 新增 package CI gate，执行 pytest、compileall 和 `pip wheel . --no-deps`，并上传 wheel artifact 作为发布前验证产物。
 - 新增 `AStockDataClient.from_defaults()` 和内置 Eastmoney/Cninfo HTTP provider，默认装配板块资金、个股分钟/日级资金、龙虎榜、解禁和公告 capability。
+- 新增 `AStockDataClient.get_board_fund_flow()`：通过 Eastmoney push2 `clist` 提供行业 / 概念 / 地域板块的今日、滚动 5 日或滚动 10 日资金流快照；支持主力净流入、净占比、涨跌幅和可用的领涨股，今日额外提供超大 / 大 / 中 / 小单净流入。该 package API 仅提供当前抓取快照，不支持任意历史交易日回放。
 
 ### 修复
 - package facade 对个股资金历史统一执行 code 过滤和 lookback 裁剪，对解禁事件严格过滤到请求股票代码，避免宿主应用混入全市场记录。

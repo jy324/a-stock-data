@@ -30,6 +30,26 @@
 
 > **双轨维护（2026-07-15）：** 仓库同时维护完整的单文件 Skill 和稳定 Python package。`src/astock_data/` 公开 `astock_data.AStockDataClient`、`ProviderResult`、`SourceMetadata`、`DataStatus` 和 `Money`；DSA 等宿主应用应依赖这些领域接口，不直接依赖 `EastmoneyClient` 或 SKILL.md 内部函数名。当前 package 是面向宿主应用的稳定能力子集，通过 `AStockDataClient.from_defaults()` 默认装配 Eastmoney/Cninfo HTTP provider，覆盖板块资金、个股分钟/日级资金、龙虎榜、解禁和公告，并包含东财限流、临时故障重试和结构化降级。
 
+### Python package：板块资金流向
+
+Skill 的广泛端点目录中有 `board_fund_flow()`；宿主应用应通过稳定的 package facade 调用，而不是引用 Skill 内嵌函数：
+
+```python
+from astock_data import AStockDataClient
+
+client = AStockDataClient.from_defaults()
+result = client.get_board_fund_flow(
+    board_type="industry",  # "industry" | "concept" | "region"
+    period="today",         # "today" | "5d" | "10d"
+    limit=20,                # 1..100
+)
+
+for board in result.data:
+    print(board["board_name"], board["main_net_inflow"])
+```
+
+这是**当前快照**能力：`today` 返回本次抓取时的当日值，`5d` / `10d` 返回东财在本次抓取时给出的滚动周期值。它不接受日期参数，也**不支持任意历史交易日回放**。用 `result.meta.fetched_at` 和与其相同的 `result.meta.as_of` 识别该快照时间；`10d` 的领涨股及 5d/10d 的超大/大/中/小单明细会按 contract 明确返回 `None`。
+
 > 兼容 [Claude Code](https://github.com/anthropics/claude-code) · [Codex](https://github.com/openai/codex) · [OpenClaw](https://github.com/anthropics/openclaw)
 >
 > Skill 文件本质是结构化 Markdown + 内嵌 Python，任何支持上下文注入的 AI 编程助手都能用。

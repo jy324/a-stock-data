@@ -8,7 +8,7 @@ the injected provider objects.
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from .models import DataStatus, ProviderResult, SourceMetadata
 
@@ -81,6 +81,38 @@ class AStockDataClient:
             limit=safe_limit,
         )
         return _replace_result_data(result, _rows(result.data)[:safe_limit], {"requested_limit": safe_limit})
+
+    def get_board_fund_flow(
+        self,
+        *,
+        board_type: Literal["industry", "concept", "region"] = "industry",
+        period: Literal["today", "5d", "10d"] = "today",
+        limit: int = 20,
+    ) -> ProviderResult[list[dict]]:
+        """Return a current board-fund-flow snapshot; historical date replay is not supported."""
+        safe_board_type = _validate_board_fund_flow_board_type(board_type)
+        safe_period = _validate_board_fund_flow_period(period)
+        safe_limit = _validate_board_fund_flow_limit(limit)
+        result = self._call(
+            self._eastmoney,
+            "get_board_fund_flow",
+            capability="board_fund_flow",
+            trade_date=None,
+            board_type=safe_board_type,
+            period=safe_period,
+            limit=safe_limit,
+        )
+        rows = _rows(result.data)[:safe_limit]
+        return _replace_result_data(
+            result,
+            rows,
+            {
+                "requested_limit": safe_limit,
+                "returned_count": len(rows),
+                "board_type": safe_board_type,
+                "period": safe_period,
+            },
+        )
 
     def get_market_dragon_tiger(
         self,
@@ -271,6 +303,24 @@ def _safe_lookback(value: int) -> int:
         return max(1, min(int(value), 120))
     except (TypeError, ValueError):
         return 120
+
+
+def _validate_board_fund_flow_board_type(value: Any) -> str:
+    if not isinstance(value, str) or value not in {"industry", "concept", "region"}:
+        raise ValueError("board_type must be one of: industry, concept, region")
+    return value
+
+
+def _validate_board_fund_flow_period(value: Any) -> str:
+    if not isinstance(value, str) or value not in {"today", "5d", "10d"}:
+        raise ValueError("period must be one of: today, 5d, 10d")
+    return value
+
+
+def _validate_board_fund_flow_limit(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    return value
 
 
 def _clip_rows_by_lookback(rows: list[dict], lookback: int) -> list[dict]:

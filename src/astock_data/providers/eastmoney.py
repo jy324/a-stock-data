@@ -7,7 +7,7 @@ import random
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -17,7 +17,42 @@ from ..models import DataStatus, ProviderResult, SourceMetadata
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 BKZJ_URL = "https://data.eastmoney.com/dataapi/bkzj/getbkzj"
+CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+BOARD_FUND_FLOW_FILTERS = {
+    "industry": "m:90+t:2",
+    "concept": "m:90+t:3",
+    "region": "m:90+t:1",
+}
+BOARD_FUND_FLOW_PERIODS: dict[str, dict[str, str | None]] = {
+    "today": {
+        "fid": "f62",
+        "main_net_inflow": "f62",
+        "main_net_inflow_pct": "f184",
+        "change_pct": "f3",
+        "leader": "f204",
+    },
+    "5d": {
+        "fid": "f164",
+        "main_net_inflow": "f164",
+        "main_net_inflow_pct": "f165",
+        "change_pct": "f109",
+        "leader": "f257",
+    },
+    "10d": {
+        "fid": "f174",
+        "main_net_inflow": "f174",
+        "main_net_inflow_pct": "f175",
+        "change_pct": "f160",
+        "leader": None,
+    },
+}
+TODAY_SIZE_BUCKET_FIELDS = {
+    "super_large_net_inflow": "f66",
+    "large_net_inflow": "f72",
+    "medium_net_inflow": "f78",
+    "small_net_inflow": "f84",
+}
 
 
 class EastmoneyProvider:
@@ -143,6 +178,78 @@ class EastmoneyProvider:
             )
         except Exception as exc:
             return self._unavailable("sector_flow_ranking", endpoint, trade_date, exc)
+
+    def get_board_fund_flow(
+        self,
+        *,
+        board_type: Literal["industry", "concept", "region"] = "industry",
+        period: Literal["today", "5d", "10d"] = "today",
+        limit: int = 20,
+    ) -> ProviderResult[list[dict]]:
+        """Fetch the current board-fund-flow snapshot for one Eastmoney taxonomy."""
+        safe_board_type = _validate_board_fund_flow_board_type(board_type)
+        safe_period = _validate_board_fund_flow_period(period)
+        safe_limit = _validate_board_fund_flow_limit(limit)
+        endpoint = CLIST_URL
+        period_fields = BOARD_FUND_FLOW_PERIODS[safe_period]
+        fields = [
+            "f12",
+            "f14",
+            period_fields["change_pct"],
+            period_fields["main_net_inflow"],
+            period_fields["main_net_inflow_pct"],
+        ]
+        if period_fields["leader"]:
+            fields.append(period_fields["leader"])
+        if safe_period == "today":
+            fields.extend(TODAY_SIZE_BUCKET_FIELDS.values())
+        coverage = {
+            "requested_limit": safe_limit,
+            "returned_count": 0,
+            "board_type": safe_board_type,
+            "period": safe_period,
+        }
+        try:
+            payload = self._get_json(
+                endpoint,
+                {
+                    "pn": "1",
+                    "pz": str(safe_limit),
+                    "po": "1",
+                    "np": "1",
+                    "fltt": "2",
+                    "invt": "2",
+                    "fid": period_fields["fid"],
+                    "fs": BOARD_FUND_FLOW_FILTERS[safe_board_type],
+                    "fields": ",".join(dict.fromkeys(field for field in fields if field)),
+                },
+                referer="https://quote.eastmoney.com/",
+            )
+            items = _board_fund_flow_items(payload)[:safe_limit]
+            rows = [
+                _board_fund_flow_row(
+                    index,
+                    item,
+                    board_type=safe_board_type,
+                    period=safe_period,
+                    period_fields=period_fields,
+                )
+                for index, item in enumerate(items, start=1)
+            ]
+            coverage["returned_count"] = len(rows)
+            warnings = _board_fund_flow_warnings(rows, period_fields)
+            return self._result(
+                "board_fund_flow",
+                endpoint,
+                rows,
+                trade_date=None,
+                unit_map=_board_fund_flow_unit_map(),
+                coverage=coverage,
+                status=DataStatus.PARTIAL if warnings else None,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            return self._unavailable("board_fund_flow", endpoint, None, exc, coverage=coverage)
 
     def get_market_dragon_tiger(
         self,
@@ -345,8 +452,13 @@ class EastmoneyProvider:
         endpoint: str,
         trade_date: str | None,
         exc: Exception,
+        *,
+        coverage: dict[str, Any] | None = None,
     ) -> ProviderResult[list[dict]]:
         warning = f"{type(exc).__name__}: {exc}"
+        result_coverage = {"coverage_ratio": 0.0, "warnings": [warning]}
+        if coverage:
+            result_coverage.update(coverage)
         return ProviderResult(
             data=[],
             meta=SourceMetadata(
@@ -358,7 +470,7 @@ class EastmoneyProvider:
                 warnings=[warning],
                 schema_version=self.schema_version,
             ),
-            coverage={"coverage_ratio": 0.0, "warnings": [warning]},
+            coverage=result_coverage,
         )
 
 
@@ -385,6 +497,17 @@ def _diff(payload: dict[str, Any]) -> list[dict[str, Any]]:
     data = payload.get("data") if isinstance(payload, dict) else None
     diff = data.get("diff") if isinstance(data, dict) else None
     return [row for row in diff if isinstance(row, dict)] if isinstance(diff, list) else []
+
+
+def _board_fund_flow_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    diff = data.get("diff") if isinstance(data, dict) else None
+    if not isinstance(diff, list):
+        raise ValueError("Eastmoney board fund flow response missing data.diff list")
+    response_code = payload.get("rc") if isinstance(payload, dict) else None
+    if response_code not in (None, "", 0, "0"):
+        raise ValueError(f"Eastmoney board fund flow upstream error: {response_code}")
+    return diff
 
 
 def _split_kline(line: str) -> list[str]:
@@ -446,6 +569,73 @@ def _sector_flow_warnings(items: list[dict[str, Any]]) -> list[str]:
     if not missing_fields:
         return []
     return ["sector_flow_ranking missing upstream fields: " + ", ".join(missing_fields)]
+
+
+def _board_fund_flow_row(
+    index: int,
+    item: dict[str, Any],
+    *,
+    board_type: str,
+    period: str,
+    period_fields: dict[str, str | None],
+) -> dict[str, Any]:
+    row = {
+        "rank": index,
+        "board_name": _to_optional_str(item.get("f14")),
+        "board_type": board_type,
+        "provider_board_code": _to_optional_str(item.get("f12")),
+        "taxonomy": "eastmoney",
+        "period": period,
+        "change_pct": _to_optional_float(item.get(period_fields["change_pct"])),
+        "main_net_inflow": _cny_amount(item.get(period_fields["main_net_inflow"])),
+        "main_net_inflow_pct": _to_optional_float(item.get(period_fields["main_net_inflow_pct"])),
+        "leader": _to_optional_str(item.get(period_fields["leader"])) if period_fields["leader"] else None,
+    }
+    for output_field, source_field in TODAY_SIZE_BUCKET_FIELDS.items():
+        row[output_field] = _cny_amount(item.get(source_field)) if period == "today" else _cny_amount(None)
+    return row
+
+
+def _board_fund_flow_warnings(rows: list[dict[str, Any]], period_fields: dict[str, str | None]) -> list[str]:
+    if not rows:
+        return []
+    missing_by_row = [
+        _board_fund_flow_missing_core_fields(row, period_fields)
+        for row in rows
+    ]
+    if not all(missing_by_row):
+        return []
+    missing_fields = sorted({field for row_fields in missing_by_row for field in row_fields})
+    return [
+        "board_fund_flow missing required core fields for every selected row: " + ", ".join(missing_fields)
+    ]
+
+
+def _board_fund_flow_missing_core_fields(row: dict[str, Any], period_fields: dict[str, str | None]) -> list[str]:
+    missing_fields = []
+    if row["provider_board_code"] is None:
+        missing_fields.append("f12")
+    if row["board_name"] is None:
+        missing_fields.append("f14")
+    if row["main_net_inflow"]["amount"] is None:
+        missing_fields.append(period_fields["main_net_inflow"])
+    if row["main_net_inflow_pct"] is None:
+        missing_fields.append(period_fields["main_net_inflow_pct"])
+    if row["change_pct"] is None:
+        missing_fields.append(period_fields["change_pct"])
+    if period_fields["leader"] and row["leader"] is None:
+        missing_fields.append(period_fields["leader"])
+    return [field for field in missing_fields if field]
+
+
+def _board_fund_flow_unit_map() -> dict[str, str]:
+    return {
+        "main_net_inflow": "CNY",
+        "super_large_net_inflow": "CNY",
+        "large_net_inflow": "CNY",
+        "medium_net_inflow": "CNY",
+        "small_net_inflow": "CNY",
+    }
 
 
 def _dragon_tiger_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -516,6 +706,10 @@ def _to_optional_float(value: Any) -> float | None:
         return None
 
 
+def _to_optional_str(value: Any) -> str | None:
+    return None if _is_missing(value) else str(value)
+
+
 def _to_optional_int(value: Any) -> int | None:
     parsed = _to_optional_float(value)
     return int(parsed) if parsed is not None else None
@@ -523,3 +717,25 @@ def _to_optional_int(value: Any) -> int | None:
 
 def _is_missing(value: Any) -> bool:
     return value in (None, "", "-")
+
+
+def _cny_amount(value: Any) -> dict[str, float | None | str]:
+    return {"amount": _to_optional_float(value), "unit": "CNY"}
+
+
+def _validate_board_fund_flow_board_type(value: Any) -> str:
+    if not isinstance(value, str) or value not in BOARD_FUND_FLOW_FILTERS:
+        raise ValueError("board_type must be one of: industry, concept, region")
+    return value
+
+
+def _validate_board_fund_flow_period(value: Any) -> str:
+    if not isinstance(value, str) or value not in BOARD_FUND_FLOW_PERIODS:
+        raise ValueError("period must be one of: today, 5d, 10d")
+    return value
+
+
+def _validate_board_fund_flow_limit(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    return value
