@@ -106,7 +106,7 @@ python -m pip wheel . --no-deps --wheel-dir dist
 DSA 等宿主应用在正式发布前应使用完整 commit SHA 固定依赖，例如：
 
 ```text
-git+https://github.com/jy324/a-stock-data.git@564f2dfb4f459f080116d54241fa0bbb14d550ed#egg=astock-data
+git+https://github.com/jy324/a-stock-data.git@a6203349cf00c6e29056c9be1cc7d103bd1fba3c#egg=astock-data
 ```
 
 启动 Claude Code，说一句「帮我看看 688017 的估值」，自动激活。
