@@ -66,6 +66,9 @@ def parse_ticker(code: str, *, stock_only: bool = False) -> ParsedTicker:
                     f"{code!r} 的市场标识与号段矛盾：{digits} 属 {natural_market} 市"
                 )
 
+    if stock_only and not _is_supported_stock(digits, market):
+        raise ValueError(f"{code!r} 不是受支持的沪深北 A 股个股代码")
+
     return ParsedTicker(digits=digits, explicit_market=market)
 
 
@@ -75,3 +78,28 @@ def _natural_market(digits: str) -> MarketPrefix:
     if digits.startswith(("5", "6", "9")):
         return "sh"
     return "sz"
+
+
+def _is_supported_stock(digits: str, explicit_market: MarketPrefix | None) -> bool:
+    if digits in SH_INDEX and explicit_market != "sz":
+        return False
+    return digits.startswith(
+        (
+            "000",
+            "001",
+            "002",
+            "003",
+            "300",
+            "301",
+            "600",
+            "601",
+            "603",
+            "605",
+            "688",
+            "689",
+            "920",
+            "43",
+            "83",
+            "87",
+        )
+    )

@@ -93,4 +93,5 @@ def test_realtime_quotes_mark_missing_requested_code_partial():
         result = provider.get_realtime_quotes(codes=["600519", "000001"])
 
     assert result.status == "partial"
+    assert result.meta.is_partial is True
     assert result.coverage["missing_codes"] == ["000001"]

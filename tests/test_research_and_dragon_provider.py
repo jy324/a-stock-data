@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import patch
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 
 from astock_data.providers.eastmoney import EastmoneyProvider
@@ -85,6 +86,45 @@ def test_old_bse_stock_report_code_is_not_silently_reported_empty():
     assert "920" in result.meta.warnings[0]
 
 
+def test_stock_reports_mark_max_pages_truncation_partial():
+    payload = {"data": [{"infoCode": "report-1", "title": "报告"}], "TotalPage": 3}
+    provider = EastmoneyProvider(min_interval=0)
+
+    with patch(
+        "astock_data.providers.eastmoney.urlopen",
+        return_value=FakeResponse(json.dumps(payload)),
+    ):
+        result = provider.get_stock_reports(code="600519", max_pages=1)
+
+    assert result.status == "partial"
+    assert result.meta.is_partial is True
+    assert result.coverage["upstream_total_pages"] == 3
+    assert result.coverage["coverage_ratio"] == 1 / 3
+    assert result.coverage["is_full_coverage"] is False
+    assert "max_pages=1" in result.meta.warnings[0]
+
+
+def test_stock_reports_keep_truthful_coverage_when_a_later_page_fails():
+    first_page = {"data": [{"infoCode": "report-1", "title": "报告"}], "TotalPage": 3}
+
+    def open_page(request, *, timeout):
+        query = parse_qs(urlparse(request.full_url).query)
+        if query["pageNo"] == ["1"]:
+            return FakeResponse(json.dumps(first_page))
+        raise URLError("page 2 failed")
+
+    provider = EastmoneyProvider(min_interval=0, max_retries=0)
+    with patch("astock_data.providers.eastmoney.urlopen", side_effect=open_page):
+        result = provider.get_stock_reports(code="600519", max_pages=3)
+
+    assert result.status == "partial"
+    assert result.meta.is_partial is True
+    assert result.coverage["upstream_total_pages"] == 3
+    assert result.coverage["coverage_ratio"] == 1 / 3
+    assert result.coverage["is_full_coverage"] is False
+    assert "page 2 unavailable" in result.meta.warnings[0]
+
+
 def test_industry_reports_default_begin_date_moves_with_beijing_today():
     def open_reports(request, *, timeout):
         query = parse_qs(urlparse(request.full_url).query)
@@ -119,6 +159,30 @@ def test_dragon_tiger_summary_returns_semantic_empty_structure_when_no_records()
 
     assert result.status == "empty"
     assert result.coverage["coverage_ratio"] == 0.0
+    assert result.data == {
+        "records": [],
+        "seats": {"buy": [], "sell": []},
+        "institution": {
+            "buy_amount": {"amount": 0.0, "unit": "CNY"},
+            "sell_amount": {"amount": 0.0, "unit": "CNY"},
+            "net_amount": {"amount": 0.0, "unit": "CNY"},
+        },
+    }
+
+
+def test_dragon_tiger_summary_keeps_dict_shape_when_provider_is_unavailable():
+    provider = EastmoneyProvider(min_interval=0, max_retries=0)
+
+    with patch(
+        "astock_data.providers.eastmoney.urlopen",
+        side_effect=URLError("unavailable"),
+    ):
+        result = provider.get_stock_dragon_tiger_summary(
+            code="600519",
+            trade_date="2026-08-05",
+        )
+
+    assert result.status == "unavailable"
     assert result.data == {
         "records": [],
         "seats": {"buy": [], "sell": []},

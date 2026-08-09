@@ -327,6 +327,8 @@ def test_tdx_facade_validates_arguments_before_provider_selection():
         client.get_tdx_bars("600519", offset=0)
     with pytest.raises(ValueError):
         client.get_tdx_transactions("600519", trade_date="2026-08-08")
+    with pytest.raises(ValueError):
+        client.get_tdx_transactions("600519", trade_date="20261399")
 
 
 def test_research_and_dragon_summary_facades_keep_stable_result_shapes():
@@ -348,6 +350,17 @@ def test_research_and_dragon_summary_facades_keep_stable_result_shapes():
     assert industry.data == [{"industry_code": "1238"}]
     assert eps.data == [{"year": "2027", "eps_mean": 1.5}]
     assert summary.data["records"] == []
+
+
+def test_unconfigured_dragon_summary_facade_keeps_dict_shape():
+    result = AStockDataClient().get_stock_dragon_tiger_summary(
+        "600519",
+        trade_date="2026-08-05",
+    )
+
+    assert result.status == "unavailable"
+    assert isinstance(result.data, dict)
+    assert result.data["records"] == []
 
 
 @pytest.mark.parametrize(

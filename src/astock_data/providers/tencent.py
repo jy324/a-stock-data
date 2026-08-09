@@ -76,6 +76,7 @@ class TencentProvider:
                     capability="realtime_quotes",
                     endpoint=endpoint,
                     status=status,
+                    is_partial=status == DataStatus.PARTIAL,
                     unit_map={
                         "price": "CNY",
                         "turnover_amount": "CNY",

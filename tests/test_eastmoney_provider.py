@@ -656,3 +656,39 @@ def test_board_fund_flow_transparently_fetches_more_than_one_page_and_reports_to
     assert result.coverage["pages_fetched"] == 2
     assert result.coverage["requested_limit_satisfied"] is True
     assert result.coverage["is_full_universe"] is True
+
+
+def test_board_fund_flow_reports_truthful_partial_coverage_when_a_later_page_fails():
+    first_page = [
+        {
+            "f12": f"BK{index:04d}",
+            "f14": f"板块{index}",
+            "f62": 1000 - index,
+            "f184": 1.0,
+            "f3": 0.5,
+            "f204": "领涨股",
+            "f66": 1,
+            "f72": 2,
+            "f78": 3,
+            "f84": 4,
+        }
+        for index in range(1, 201)
+    ]
+
+    def open_page(request, *, timeout):
+        query = parse_qs(urlparse(request.full_url).query)
+        if query["pn"] == ["1"]:
+            return FakeResponse(json.dumps({"data": {"total": 400, "diff": first_page}}))
+        raise URLError("page 2 failed")
+
+    provider = EastmoneyProvider(min_interval=0, max_retries=0)
+    with patch("astock_data.providers.eastmoney.urlopen", side_effect=open_page):
+        result = provider.get_board_fund_flow(limit=300)
+
+    assert result.status == "partial"
+    assert result.meta.is_partial is True
+    assert len(result.data) == 200
+    assert result.coverage["coverage_ratio"] == pytest.approx(200 / 300)
+    assert result.coverage["requested_limit_satisfied"] is False
+    assert result.coverage["is_full_universe"] is False
+    assert "page 2 unavailable" in result.meta.warnings[0]

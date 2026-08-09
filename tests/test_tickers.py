@@ -39,6 +39,20 @@ def test_stock_only_normalization_rejects_explicit_shanghai_indices(raw):
         normalize_ticker(raw, stock_only=True)
 
 
+@pytest.mark.parametrize("raw", ["510300", "159919", "399001", "113001", "900901"])
+def test_stock_only_normalization_rejects_non_stock_security_ranges(raw):
+    with pytest.raises(ValueError, match="个股"):
+        normalize_ticker(raw, stock_only=True)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["600519", "688017", "000001", "300750", "920982", "832982", "SZ000010"],
+)
+def test_stock_only_normalization_accepts_supported_shenzhen_shanghai_and_bse_stocks(raw):
+    assert len(normalize_ticker(raw, stock_only=True)) == 6
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

@@ -116,9 +116,7 @@ class AStockDataClient:
         market: str = "std",
     ) -> ProviderResult[list[dict]]:
         safe_symbol = _normalize_tdx_symbol(symbol, market)
-        date_text = str(trade_date)
-        if len(date_text) != 8 or not date_text.isdigit():
-            raise ValueError("trade_date must use YYYYMMDD")
+        date_text = _validate_compact_date(trade_date, "trade_date")
         result = self._call(
             self._tdx,
             "get_transactions",
@@ -208,7 +206,7 @@ class AStockDataClient:
         )
         return _replace_result_data(
             result,
-            result.data,
+            _dragon_tiger_summary_data(result.data),
             {"filtered_code": normalized, "lookback_days": safe_lookback},
         )
 
@@ -611,6 +609,31 @@ def _validate_iso_date(value: Any, name: str) -> str:
         return date.fromisoformat(text).isoformat()
     except ValueError as exc:
         raise ValueError(f"{name} must use YYYY-MM-DD") from exc
+
+
+def _validate_compact_date(value: Any, name: str) -> str:
+    text = str(value or "")
+    if len(text) != 8 or not text.isdigit():
+        raise ValueError(f"{name} must use YYYYMMDD")
+    try:
+        date.fromisoformat(f"{text[:4]}-{text[4:6]}-{text[6:]}")
+    except ValueError as exc:
+        raise ValueError(f"{name} must use YYYYMMDD") from exc
+    return text
+
+
+def _dragon_tiger_summary_data(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {
+        "records": [],
+        "seats": {"buy": [], "sell": []},
+        "institution": {
+            "buy_amount": {"amount": 0.0, "unit": "CNY"},
+            "sell_amount": {"amount": 0.0, "unit": "CNY"},
+            "net_amount": {"amount": 0.0, "unit": "CNY"},
+        },
+    }
 
 
 def _clip_rows_by_lookback(rows: list[dict], lookback: int) -> list[dict]:

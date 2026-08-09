@@ -300,6 +300,8 @@ class EastmoneyProvider:
             coverage["is_full_universe"] = reached_end or (
                 upstream_total is not None and len(items) >= upstream_total
             )
+            coverage_target = min(safe_limit, upstream_total) if upstream_total is not None else safe_limit
+            coverage["coverage_ratio"] = len(rows) / coverage_target if rows and coverage_target else 0.0
             warnings.extend(_board_fund_flow_warnings(rows, period_fields))
             return self._result(
                 "board_fund_flow",
@@ -432,6 +434,8 @@ class EastmoneyProvider:
         coverage = {
             "requested_max_pages": safe_max_pages,
             "pages_fetched": 0,
+            "upstream_total_pages": None,
+            "is_full_coverage": False,
             "returned_count": 0,
             "filtered_code": normalized_code,
         }
@@ -482,6 +486,8 @@ class EastmoneyProvider:
         coverage = {
             "requested_max_pages": safe_max_pages,
             "pages_fetched": 0,
+            "upstream_total_pages": None,
+            "is_full_coverage": False,
             "returned_count": 0,
             "industry_code": safe_industry_code,
             "begin_date": begin,
@@ -517,6 +523,8 @@ class EastmoneyProvider:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         all_rows: list[dict[str, Any]] = []
         warnings: list[str] = []
+        upstream_total_pages: int | None = None
+        is_full_coverage = False
         for page in range(1, max_pages + 1):
             params = {
                 "pageSize": "100",
@@ -549,9 +557,24 @@ class EastmoneyProvider:
             if not isinstance(page_rows, list):
                 raise ValueError("Eastmoney report response data is not a list")
             all_rows.extend(row for row in page_rows if isinstance(row, dict))
-            total_pages = _to_int(payload.get("TotalPage")) or 1
-            if not page_rows or page >= total_pages:
+            total_pages = _to_int(payload.get("TotalPage"))
+            upstream_total_pages = max(upstream_total_pages or 0, total_pages)
+            if not page_rows or total_pages == 0 or page >= total_pages:
+                is_full_coverage = True
                 break
+        if not is_full_coverage and not warnings and upstream_total_pages is not None:
+            warnings.append(
+                f"report pagination truncated at max_pages={max_pages} "
+                f"of upstream TotalPage={upstream_total_pages}"
+            )
+        coverage["upstream_total_pages"] = upstream_total_pages
+        coverage["is_full_coverage"] = is_full_coverage
+        if all_rows and is_full_coverage:
+            coverage["coverage_ratio"] = 1.0
+        elif all_rows and upstream_total_pages:
+            coverage["coverage_ratio"] = min(1.0, coverage["pages_fetched"] / upstream_total_pages)
+        else:
+            coverage["coverage_ratio"] = 0.0
         return all_rows, warnings
 
     def get_stock_dragon_tiger_summary(
@@ -606,17 +629,16 @@ class EastmoneyProvider:
                         warnings.append(f"{side} seats unavailable: {type(exc).__name__}: {exc}")
             institution_buy = sum(_to_float(row.get("BUY")) for row in buy_rows if str(row.get("OPERATEDEPT_CODE") or "") == "0")
             institution_sell = sum(_to_float(row.get("SELL")) for row in sell_rows if str(row.get("OPERATEDEPT_CODE") or "") == "0")
-            data = {
-                "records": records,
-                "seats": {
-                    "buy": [_dragon_seat_row(row) for row in buy_rows[:5]],
-                    "sell": [_dragon_seat_row(row) for row in sell_rows[:5]],
-                },
-                "institution": {
-                    "buy_amount": _cny_amount(institution_buy),
-                    "sell_amount": _cny_amount(institution_sell),
-                    "net_amount": _cny_amount(institution_buy - institution_sell),
-                },
+            data = _empty_dragon_tiger_summary()
+            data["records"] = records
+            data["seats"] = {
+                "buy": [_dragon_seat_row(row) for row in buy_rows[:5]],
+                "sell": [_dragon_seat_row(row) for row in sell_rows[:5]],
+            }
+            data["institution"] = {
+                "buy_amount": _cny_amount(institution_buy),
+                "sell_amount": _cny_amount(institution_sell),
+                "net_amount": _cny_amount(institution_buy - institution_sell),
             }
             coverage["record_count"] = len(records)
             status = DataStatus.PARTIAL if warnings else (DataStatus.OK if records else DataStatus.EMPTY)
@@ -643,6 +665,7 @@ class EastmoneyProvider:
                 query_date,
                 exc,
                 coverage=coverage,
+                data=_empty_dragon_tiger_summary(),
             )
 
     def _get_anomaly_payload(self, endpoint: str, page: int, page_size: int) -> dict[str, Any]:
@@ -824,14 +847,14 @@ class EastmoneyProvider:
         self,
         capability: str,
         endpoint: str,
-        data: list[dict],
+        data: Any,
         *,
         trade_date: str | None,
         unit_map: dict[str, str] | None = None,
         coverage: dict[str, Any] | None = None,
         status: DataStatus | None = None,
         warnings: list[str] | None = None,
-    ) -> ProviderResult[list[dict]]:
+    ) -> ProviderResult[Any]:
         result_status = status or (DataStatus.OK if data else DataStatus.EMPTY)
         result_coverage = {
             "coverage_ratio": 0.0 if result_status == DataStatus.EMPTY else (1.0 if data else 0.0)
@@ -848,6 +871,7 @@ class EastmoneyProvider:
                 endpoint=endpoint,
                 status=result_status,
                 trade_date=trade_date,
+                is_partial=result_status == DataStatus.PARTIAL,
                 unit_map=unit_map or {},
                 warnings=warnings or [],
                 schema_version=self.schema_version,
@@ -863,13 +887,14 @@ class EastmoneyProvider:
         exc: Exception,
         *,
         coverage: dict[str, Any] | None = None,
-    ) -> ProviderResult[list[dict]]:
+        data: Any = None,
+    ) -> ProviderResult[Any]:
         warning = f"{type(exc).__name__}: {exc}"
         result_coverage = {"coverage_ratio": 0.0, "warnings": [warning]}
         if coverage:
             result_coverage.update(coverage)
         return ProviderResult(
-            data=[],
+            data=[] if data is None else data,
             meta=SourceMetadata(
                 provider=self.provider_name,
                 capability=capability,
@@ -1128,6 +1153,18 @@ def _dragon_seat_row(raw: dict[str, Any]) -> dict[str, Any]:
         "sell_amount": _cny_amount(raw.get("SELL")),
         "net_amount": _cny_amount(raw.get("NET")),
         "is_institution": str(raw.get("OPERATEDEPT_CODE") or "") == "0",
+    }
+
+
+def _empty_dragon_tiger_summary() -> dict[str, Any]:
+    return {
+        "records": [],
+        "seats": {"buy": [], "sell": []},
+        "institution": {
+            "buy_amount": _cny_amount(0),
+            "sell_amount": _cny_amount(0),
+            "net_amount": _cny_amount(0),
+        },
     }
 
 

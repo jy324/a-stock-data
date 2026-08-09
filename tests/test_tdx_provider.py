@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from astock_data.providers.tdx import TdxProvider
 
 
@@ -98,3 +100,11 @@ def test_tdx_factory_failure_returns_structured_unavailable():
 
     assert result.status == "unavailable"
     assert "mootdx" in result.meta.warnings[0]
+
+
+@pytest.mark.parametrize("invalid_date", ["20261399", "202681", "2026081"])
+def test_tdx_transactions_reject_invalid_compact_date(invalid_date):
+    provider = TdxProvider(quotes_factory=lambda **kwargs: None, servers=[])
+
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        provider.get_transactions(symbol="600519", date=invalid_date)

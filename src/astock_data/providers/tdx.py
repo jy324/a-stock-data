@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from typing import Any
 
 from ..models import DataStatus, ProviderResult, SourceMetadata
@@ -70,13 +71,18 @@ class TdxProvider:
         market: str = "std",
     ) -> ProviderResult[list[dict]]:
         safe_symbol = _validate_symbol(symbol, market)
-        if len(str(date)) != 8 or not str(date).isdigit():
+        date_text = str(date)
+        if len(date_text) != 8 or not date_text.isdigit():
             raise ValueError("trade_date must use YYYYMMDD")
+        try:
+            datetime.strptime(date_text, "%Y%m%d")
+        except ValueError as exc:
+            raise ValueError("trade_date must use YYYYMMDD") from exc
         return self._call(
             "tdx_transactions",
             market,
-            lambda client: client.transaction(symbol=safe_symbol, date=str(date)),
-            trade_date=f"{str(date)[:4]}-{str(date)[4:6]}-{str(date)[6:]}",
+            lambda client: client.transaction(symbol=safe_symbol, date=date_text),
+            trade_date=f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}",
         )
 
     def _call(
