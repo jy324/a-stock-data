@@ -6,18 +6,44 @@ import json
 import random
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from ..models import DataStatus, ProviderResult, SourceMetadata
+from ..tickers import normalize_ticker
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 BKZJ_URL = "https://data.eastmoney.com/dataapi/bkzj/getbkzj"
 CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+MONITOR_URL = "https://mobappconfig.securities.eastmoney.com/emcfg/stock_monitor.json"
+ANOMALY_BASE_URL = "https://dycalchis.eastmoney.com/price-anomaly"
+REPORT_API_URL = "https://reportapi.eastmoney.com/report/list"
+ANOMALY_COMMON_PARAMS = {
+    "team": "h5",
+    "product": "EastMoney",
+    "client": "WAP",
+    "version": "9001",
+    "name": "WAP",
+    "user": "123",
+}
+ANOMALY_RULES = {
+    1: "主板连续10个交易日内4次出现同向异常波动",
+    2: "创业板连续10个交易日内3次出现同向异常波动",
+    3: "科创板连续10个交易日内3次出现同向异常波动",
+    4: "连续十个交易日内日收盘价涨跌幅偏离值累计达到+100%",
+    5: "连续十个交易日内日收盘价涨跌幅偏离值累计达到-50%",
+    6: "连续三十个交易日内日收盘价涨跌幅偏离值累计达到+200%",
+    7: "连续三十个交易日内日收盘价涨跌幅偏离值累计达到-70%",
+    8: "北交所连续10个交易日内3次出现同向异常波动",
+    40: "连续十个交易日内日收盘价涨跌幅偏离值累计达到+150%",
+    50: "连续十个交易日内日收盘价涨跌幅偏离值累计达到-60%",
+    60: "连续30个交易日内日收盘价涨跌幅偏离值累计达到+300%",
+    70: "连续30个交易日内日收盘价涨跌幅偏离值累计达到-75%",
+}
 RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 BOARD_FUND_FLOW_FILTERS = {
     "industry": "m:90+t:2",
@@ -208,24 +234,56 @@ class EastmoneyProvider:
             "returned_count": 0,
             "board_type": safe_board_type,
             "period": safe_period,
+            "upstream_total": None,
+            "pages_fetched": 0,
+            "requested_limit_satisfied": False,
+            "is_full_universe": False,
         }
+        items: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        upstream_total: int | None = None
+        reached_end = False
         try:
-            payload = self._get_json(
-                endpoint,
-                {
-                    "pn": "1",
-                    "pz": str(safe_limit),
-                    "po": "1",
-                    "np": "1",
-                    "fltt": "2",
-                    "invt": "2",
-                    "fid": period_fields["fid"],
-                    "fs": BOARD_FUND_FLOW_FILTERS[safe_board_type],
-                    "fields": ",".join(dict.fromkeys(field for field in fields if field)),
-                },
-                referer="https://quote.eastmoney.com/",
-            )
-            items = _board_fund_flow_items(payload)[:safe_limit]
+            page_number = 1
+            while len(items) < safe_limit:
+                try:
+                    payload = self._get_json(
+                        endpoint,
+                        {
+                            "pn": str(page_number),
+                            "pz": "200",
+                            "po": "1",
+                            "np": "1",
+                            "fltt": "2",
+                            "invt": "2",
+                            "fid": period_fields["fid"],
+                            "fs": BOARD_FUND_FLOW_FILTERS[safe_board_type],
+                            "fields": ",".join(dict.fromkeys(field for field in fields if field)),
+                        },
+                        referer="https://quote.eastmoney.com/",
+                    )
+                except Exception as exc:
+                    if not items:
+                        raise
+                    warnings.append(f"page {page_number} unavailable: {type(exc).__name__}: {exc}")
+                    break
+
+                page_items, page_total = _board_fund_flow_page(payload)
+                coverage["pages_fetched"] += 1
+                if page_total is not None:
+                    upstream_total = max(upstream_total or 0, page_total)
+                items.extend(page_items)
+                if not page_items or len(page_items) < 200:
+                    reached_end = True
+                    break
+                if upstream_total is not None and len(items) >= upstream_total:
+                    reached_end = True
+                    break
+                page_number += 1
+
+            if upstream_total is None and reached_end:
+                upstream_total = len(items)
+            selected_items = items[:safe_limit]
             rows = [
                 _board_fund_flow_row(
                     index,
@@ -234,10 +292,15 @@ class EastmoneyProvider:
                     period=safe_period,
                     period_fields=period_fields,
                 )
-                for index, item in enumerate(items, start=1)
+                for index, item in enumerate(selected_items, start=1)
             ]
             coverage["returned_count"] = len(rows)
-            warnings = _board_fund_flow_warnings(rows, period_fields)
+            coverage["upstream_total"] = upstream_total
+            coverage["requested_limit_satisfied"] = len(items) >= safe_limit or reached_end
+            coverage["is_full_universe"] = reached_end or (
+                upstream_total is not None and len(items) >= upstream_total
+            )
+            warnings.extend(_board_fund_flow_warnings(rows, period_fields))
             return self._result(
                 "board_fund_flow",
                 endpoint,
@@ -250,6 +313,350 @@ class EastmoneyProvider:
             )
         except Exception as exc:
             return self._unavailable("board_fund_flow", endpoint, None, exc, coverage=coverage)
+
+    def get_stock_monitor(self, *, active_only: bool = True) -> ProviderResult[list[dict]]:
+        if not isinstance(active_only, bool):
+            raise ValueError("active_only must be a boolean")
+        evaluation_date = _cn_today()
+        coverage = {
+            "active_only": active_only,
+            "evaluation_date": evaluation_date,
+            "upstream_total": 0,
+            "returned_count": 0,
+        }
+        try:
+            payload = self._get_json(
+                MONITOR_URL,
+                {},
+                referer="https://vipmoney.eastmoney.com/",
+                timeout=20,
+            )
+            raw_rows = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(raw_rows, list):
+                raise ValueError("Eastmoney stock monitor response is not a list")
+            coverage["upstream_total"] = len(raw_rows)
+            rows = []
+            warnings = []
+            market_map = {"1": "SH", "0": "SZ", "B": "BJ"}
+            for raw in raw_rows:
+                if not isinstance(raw, dict):
+                    continue
+                start = str(raw.get("VALIDATESTARTDATE") or "")
+                end = str(raw.get("VALIDATEENDDATE") or "")
+                if active_only and not (start <= evaluation_date <= end):
+                    continue
+                raw_market = str(raw.get("MARKET") or "").upper()
+                market = market_map.get(raw_market, f"?{raw_market}")
+                if market.startswith("?"):
+                    warnings.append(f"unknown monitor market: {raw_market!r}")
+                rows.append(
+                    {
+                        "code": str(raw.get("STKCODE") or ""),
+                        "name": str(raw.get("STKNAME") or ""),
+                        "market": market,
+                        "start_date": start,
+                        "end_date": end,
+                        "link": str(raw.get("LINK_URL") or ""),
+                    }
+                )
+            coverage["returned_count"] = len(rows)
+            return self._result(
+                "stock_monitor",
+                MONITOR_URL,
+                rows,
+                trade_date=None,
+                coverage=coverage,
+                status=DataStatus.PARTIAL if warnings else None,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            return self._unavailable("stock_monitor", MONITOR_URL, None, exc, coverage=coverage)
+
+    def get_price_anomalies(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 200,
+    ) -> ProviderResult[list[dict]]:
+        safe_page = _validate_positive_int(page, "page")
+        safe_page_size = _validate_page_size(page_size)
+        endpoint = f"{ANOMALY_BASE_URL}/list"
+        coverage = {"page": safe_page, "page_size": safe_page_size, "total_pages": 0, "returned_count": 0}
+        try:
+            payload = self._get_anomaly_payload(endpoint, safe_page, safe_page_size)
+            rows = [_price_anomaly_row(raw) for raw in payload.get("data") or [] if isinstance(raw, dict)]
+            trade_date = _format_compact_date(payload.get("date"))
+            coverage["total_pages"] = _to_int(payload.get("pages"))
+            coverage["returned_count"] = len(rows)
+            return self._result(
+                "price_anomalies",
+                endpoint,
+                rows,
+                trade_date=trade_date,
+                unit_map={"change_pct": "%", "deviation_pct": "%"},
+                coverage=coverage,
+            )
+        except Exception as exc:
+            return self._unavailable("price_anomalies", endpoint, None, exc, coverage=coverage)
+
+    def get_price_anomaly_counts(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> ProviderResult[list[dict]]:
+        safe_page = _validate_positive_int(page, "page")
+        safe_page_size = _validate_page_size(page_size)
+        endpoint = f"{ANOMALY_BASE_URL}/count"
+        coverage = {"page": safe_page, "page_size": safe_page_size, "total_pages": 0, "returned_count": 0}
+        try:
+            payload = self._get_anomaly_payload(endpoint, safe_page, safe_page_size)
+            rows = [_price_anomaly_count_row(raw) for raw in payload.get("data") or [] if isinstance(raw, dict)]
+            trade_date = _format_compact_date(payload.get("date"))
+            coverage["total_pages"] = _to_int(payload.get("pages"))
+            coverage["returned_count"] = len(rows)
+            return self._result(
+                "price_anomaly_counts",
+                endpoint,
+                rows,
+                trade_date=trade_date,
+                unit_map={"price": "CNY", "change_pct": "%", "deviation_pct": "%"},
+                coverage=coverage,
+            )
+        except Exception as exc:
+            return self._unavailable("price_anomaly_counts", endpoint, None, exc, coverage=coverage)
+
+    def get_stock_reports(self, *, code: str, max_pages: int = 5) -> ProviderResult[list[dict]]:
+        normalized_code = normalize_ticker(code, stock_only=True)
+        safe_max_pages = _validate_max_pages(max_pages)
+        coverage = {
+            "requested_max_pages": safe_max_pages,
+            "pages_fetched": 0,
+            "returned_count": 0,
+            "filtered_code": normalized_code,
+        }
+        try:
+            rows, warnings = self._fetch_reports(
+                qtype="0",
+                max_pages=safe_max_pages,
+                extra_params={
+                    "industryCode": "*",
+                    "beginTime": "2000-01-01",
+                    "code": normalized_code,
+                    "orgCode": "",
+                    "rcode": "",
+                },
+                coverage=coverage,
+            )
+            if not rows and normalized_code[:2] in {"43", "83", "87"}:
+                raise ValueError(
+                    f"{normalized_code} 属北交所老号段，研报索引多数已迁至 920xxx，请反查现行代码"
+                )
+            data = [_report_row(row) for row in rows]
+            coverage["returned_count"] = len(data)
+            return self._result(
+                "stock_reports",
+                REPORT_API_URL,
+                data,
+                trade_date=None,
+                coverage=coverage,
+                status=DataStatus.PARTIAL if warnings else None,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            return self._unavailable("stock_reports", REPORT_API_URL, None, exc, coverage=coverage)
+
+    def get_industry_reports(
+        self,
+        *,
+        industry_code: str = "*",
+        begin_date: str | None = None,
+        max_pages: int = 5,
+    ) -> ProviderResult[list[dict]]:
+        safe_industry_code = str(industry_code or "*").strip()
+        safe_max_pages = _validate_max_pages(max_pages)
+        if begin_date is None:
+            begin = (datetime.strptime(_cn_today(), "%Y-%m-%d") - timedelta(days=730)).date().isoformat()
+        else:
+            begin = _validate_iso_date(begin_date, "begin_date")
+        coverage = {
+            "requested_max_pages": safe_max_pages,
+            "pages_fetched": 0,
+            "returned_count": 0,
+            "industry_code": safe_industry_code,
+            "begin_date": begin,
+        }
+        try:
+            rows, warnings = self._fetch_reports(
+                qtype="1",
+                max_pages=safe_max_pages,
+                extra_params={"industryCode": safe_industry_code, "beginTime": begin},
+                coverage=coverage,
+            )
+            data = [_report_row(row) for row in rows]
+            coverage["returned_count"] = len(data)
+            return self._result(
+                "industry_reports",
+                REPORT_API_URL,
+                data,
+                trade_date=None,
+                coverage=coverage,
+                status=DataStatus.PARTIAL if warnings else None,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            return self._unavailable("industry_reports", REPORT_API_URL, None, exc, coverage=coverage)
+
+    def _fetch_reports(
+        self,
+        *,
+        qtype: str,
+        max_pages: int,
+        extra_params: dict[str, Any],
+        coverage: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        all_rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for page in range(1, max_pages + 1):
+            params = {
+                "pageSize": "100",
+                "industry": "*",
+                "rating": "*",
+                "ratingChange": "*",
+                "endTime": "2030-01-01",
+                "pageNo": str(page),
+                "fields": "",
+                "qType": qtype,
+                "p": str(page),
+                "pageNum": str(page),
+                "pageNumber": str(page),
+                **extra_params,
+            }
+            try:
+                payload = self._get_json(
+                    REPORT_API_URL,
+                    params,
+                    referer="https://data.eastmoney.com/",
+                    timeout=30,
+                )
+            except Exception as exc:
+                if not all_rows:
+                    raise
+                warnings.append(f"page {page} unavailable: {type(exc).__name__}: {exc}")
+                break
+            coverage["pages_fetched"] += 1
+            page_rows = payload.get("data") or []
+            if not isinstance(page_rows, list):
+                raise ValueError("Eastmoney report response data is not a list")
+            all_rows.extend(row for row in page_rows if isinstance(row, dict))
+            total_pages = _to_int(payload.get("TotalPage")) or 1
+            if not page_rows or page >= total_pages:
+                break
+        return all_rows, warnings
+
+    def get_stock_dragon_tiger_summary(
+        self,
+        *,
+        code: str,
+        trade_date: str,
+        lookback: int = 30,
+    ) -> ProviderResult[dict[str, Any]]:
+        normalized_code = normalize_ticker(code, stock_only=True)
+        query_date = _validate_iso_date(trade_date, "trade_date")
+        safe_lookback = _validate_bounded_positive_int(lookback, "lookback", 365)
+        start_date = (
+            datetime.strptime(query_date, "%Y-%m-%d") - timedelta(days=safe_lookback)
+        ).strftime("%Y-%m-%d")
+        coverage = {"lookback_days": safe_lookback, "record_count": 0, "latest_record_date": None}
+        try:
+            raw_records = self._datacenter(
+                "RPT_DAILYBILLBOARD_DETAILSNEW",
+                filter_str=(
+                    f"(TRADE_DATE>='{start_date}')(TRADE_DATE<='{query_date}')"
+                    f'(SECURITY_CODE="{normalized_code}")'
+                ),
+                page_size=50,
+                sort_columns="TRADE_DATE",
+                sort_types="-1",
+            )
+            records = [_dragon_summary_record(row) for row in raw_records]
+            buy_rows: list[dict[str, Any]] = []
+            sell_rows: list[dict[str, Any]] = []
+            warnings: list[str] = []
+            if records:
+                latest_date = records[0]["date"]
+                coverage["latest_record_date"] = latest_date
+                for report_name, side in (
+                    ("RPT_BILLBOARD_DAILYDETAILSBUY", "buy"),
+                    ("RPT_BILLBOARD_DAILYDETAILSSELL", "sell"),
+                ):
+                    try:
+                        detail_rows = self._datacenter(
+                            report_name,
+                            filter_str=f'(TRADE_DATE=\'{latest_date}\')(SECURITY_CODE="{normalized_code}")',
+                            page_size=10,
+                            sort_columns="BUY" if side == "buy" else "SELL",
+                            sort_types="-1",
+                        )
+                        if side == "buy":
+                            buy_rows = detail_rows
+                        else:
+                            sell_rows = detail_rows
+                    except Exception as exc:
+                        warnings.append(f"{side} seats unavailable: {type(exc).__name__}: {exc}")
+            institution_buy = sum(_to_float(row.get("BUY")) for row in buy_rows if str(row.get("OPERATEDEPT_CODE") or "") == "0")
+            institution_sell = sum(_to_float(row.get("SELL")) for row in sell_rows if str(row.get("OPERATEDEPT_CODE") or "") == "0")
+            data = {
+                "records": records,
+                "seats": {
+                    "buy": [_dragon_seat_row(row) for row in buy_rows[:5]],
+                    "sell": [_dragon_seat_row(row) for row in sell_rows[:5]],
+                },
+                "institution": {
+                    "buy_amount": _cny_amount(institution_buy),
+                    "sell_amount": _cny_amount(institution_sell),
+                    "net_amount": _cny_amount(institution_buy - institution_sell),
+                },
+            }
+            coverage["record_count"] = len(records)
+            status = DataStatus.PARTIAL if warnings else (DataStatus.OK if records else DataStatus.EMPTY)
+            return self._result(
+                "stock_dragon_tiger_summary",
+                DATACENTER_URL,
+                data,
+                trade_date=query_date,
+                unit_map={
+                    "records.net_buy": "CNY",
+                    "seats.buy_amount": "CNY",
+                    "seats.sell_amount": "CNY",
+                    "seats.net_amount": "CNY",
+                    "institution": "CNY",
+                },
+                coverage=coverage,
+                status=status,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            return self._unavailable(
+                "stock_dragon_tiger_summary",
+                DATACENTER_URL,
+                query_date,
+                exc,
+                coverage=coverage,
+            )
+
+    def _get_anomaly_payload(self, endpoint: str, page: int, page_size: int) -> dict[str, Any]:
+        payload = self._get_json(
+            endpoint,
+            {**ANOMALY_COMMON_PARAMS, "pageSize": str(page_size), "pageNo": str(page)},
+            referer="https://vipmoney.eastmoney.com/",
+            timeout=20,
+        )
+        if payload.get("result") != 0:
+            raise RuntimeError(
+                f"Eastmoney price anomaly rejected: result={payload.get('result')} msg={payload.get('msg')!r}"
+            )
+        return payload
 
     def get_market_dragon_tiger(
         self,
@@ -426,7 +833,9 @@ class EastmoneyProvider:
         warnings: list[str] | None = None,
     ) -> ProviderResult[list[dict]]:
         result_status = status or (DataStatus.OK if data else DataStatus.EMPTY)
-        result_coverage = {"coverage_ratio": 1.0 if data else 0.0}
+        result_coverage = {
+            "coverage_ratio": 0.0 if result_status == DataStatus.EMPTY else (1.0 if data else 0.0)
+        }
         if coverage:
             result_coverage.update(coverage)
         if warnings:
@@ -499,7 +908,7 @@ def _diff(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [row for row in diff if isinstance(row, dict)] if isinstance(diff, list) else []
 
 
-def _board_fund_flow_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _board_fund_flow_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
     data = payload.get("data") if isinstance(payload, dict) else None
     diff = data.get("diff") if isinstance(data, dict) else None
     if not isinstance(diff, list):
@@ -507,7 +916,12 @@ def _board_fund_flow_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     response_code = payload.get("rc") if isinstance(payload, dict) else None
     if response_code not in (None, "", 0, "0"):
         raise ValueError(f"Eastmoney board fund flow upstream error: {response_code}")
-    return diff
+    total_value = data.get("total") if isinstance(data, dict) else None
+    try:
+        total = int(total_value) if total_value not in (None, "") else None
+    except (TypeError, ValueError):
+        total = None
+    return [row for row in diff if isinstance(row, dict)], total
 
 
 def _split_kline(line: str) -> list[str]:
@@ -638,6 +1052,122 @@ def _board_fund_flow_unit_map() -> dict[str, str]:
     }
 
 
+def _cn_today() -> str:
+    return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+
+
+def _anomaly_market(code: Any, market: Any, board: Any = None) -> str:
+    digits = str(code or "")
+    if digits.startswith("920") or digits[:2] in {"43", "83", "87"} or board == 8:
+        return "BJ"
+    return "SH" if market == 1 else "SZ"
+
+
+def _price_anomaly_row(raw: dict[str, Any]) -> dict[str, Any]:
+    source_rule = raw.get("e")
+    rule_code = source_rule * 10 if raw.get("s") == 6 and source_rule in {4, 5, 6, 7} else source_rule
+    return {
+        "code": str(raw.get("c") or ""),
+        "name": str(raw.get("n") or ""),
+        "market": _anomaly_market(raw.get("c"), raw.get("m"), raw.get("s")),
+        "change_pct": _to_optional_float(raw.get("a")),
+        "deviation_pct": _to_optional_float(raw.get("x")),
+        "days": _to_optional_int(raw.get("d")),
+        "board_code": _to_optional_int(raw.get("s")),
+        "rule_code": rule_code,
+        "rule": ANOMALY_RULES.get(rule_code, f"未知规则码 {rule_code}"),
+        "is_today": raw.get("o") != 2,
+    }
+
+
+def _price_anomaly_count_row(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "code": str(raw.get("c") or ""),
+        "name": str(raw.get("n") or ""),
+        "market": _anomaly_market(raw.get("c"), raw.get("m"), raw.get("s")),
+        "price": _to_optional_float(raw.get("p")),
+        "change_pct": _to_optional_float(raw.get("a")),
+        "times": _to_optional_int(raw.get("t")),
+        "deviation_pct": _to_optional_float(raw.get("x")),
+        "days": _to_optional_int(raw.get("d")),
+        "board_code": _to_optional_int(raw.get("s")),
+    }
+
+
+def _report_row(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "report_id": str(raw.get("infoCode") or ""),
+        "title": str(raw.get("title") or ""),
+        "publish_date": str(raw.get("publishDate") or "")[:10],
+        "organization": str(raw.get("orgSName") or ""),
+        "rating": _to_optional_str(raw.get("emRatingName")),
+        "industry_name": _to_optional_str(raw.get("indvInduName") or raw.get("industryName")),
+        "industry_code": _to_optional_str(raw.get("industryCode")),
+        "eps_current_year": _to_optional_float(raw.get("predictThisYearEps")),
+        "eps_next_year": _to_optional_float(raw.get("predictNextYearEps")),
+        "eps_next_two_year": _to_optional_float(raw.get("predictNextTwoYearEps")),
+        "report_type": _to_optional_str(raw.get("reportType")),
+        "pages": _to_optional_int(raw.get("attachPages")),
+        "size_kb": _to_optional_float(raw.get("attachSize")),
+    }
+
+
+def _dragon_summary_record(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": str(raw.get("TRADE_DATE") or "")[:10],
+        "reason": str(raw.get("EXPLANATION") or ""),
+        "net_buy": _cny_amount(raw.get("BILLBOARD_NET_AMT")),
+        "turnover_pct": _to_optional_float(raw.get("TURNOVERRATE")),
+    }
+
+
+def _dragon_seat_row(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(raw.get("OPERATEDEPT_NAME") or ""),
+        "buy_amount": _cny_amount(raw.get("BUY")),
+        "sell_amount": _cny_amount(raw.get("SELL")),
+        "net_amount": _cny_amount(raw.get("NET")),
+        "is_institution": str(raw.get("OPERATEDEPT_CODE") or "") == "0",
+    }
+
+
+def _format_compact_date(value: Any) -> str | None:
+    text = str(value or "")
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text or None
+
+
+def _validate_positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validate_page_size(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 200:
+        raise ValueError("page_size must be an integer between 1 and 200")
+    return value
+
+
+def _validate_max_pages(value: Any) -> int:
+    return _validate_bounded_positive_int(value, "max_pages", 20)
+
+
+def _validate_bounded_positive_int(value: Any, name: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between 1 and {maximum}")
+    return value
+
+
+def _validate_iso_date(value: Any, name: str) -> str:
+    text = str(value or "")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{name} must use YYYY-MM-DD") from exc
+
+
 def _dragon_tiger_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "code": row.get("SECURITY_CODE") or "",
@@ -736,6 +1266,6 @@ def _validate_board_fund_flow_period(value: Any) -> str:
 
 
 def _validate_board_fund_flow_limit(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
-        raise ValueError("limit must be an integer between 1 and 100")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+        raise ValueError("limit must be an integer between 1 and 1000")
     return value

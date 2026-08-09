@@ -28,6 +28,30 @@ Full-stack data toolkit for China A-Share market — 10-layer architecture · 47
 
 A self-contained Skill file that consolidates raw A-share data from 15 sources into a ready-to-use toolkit for AI coding assistants. No need to memorize mootdx candlestick parameters, Eastmoney PDF Referer headers, or iwencai X-Claw authentication — it's all handled. And when a primary source bans you, there's a backup-source quick reference to fall back on.
 
+> **Dual-track maintenance:** this repository contains the complete single-file Skill v3.6.1 and the stable Python package v0.2.0. Host applications should depend on `astock_data.AStockDataClient` and its structured `ProviderResult` contract instead of embedded Skill functions or vendor clients.
+
+### Python package v0.2.0
+
+The base package keeps zero third-party runtime dependencies. Install optional mootdx and HTML-table parsing support only when needed:
+
+```bash
+python -m pip install -e .
+python -m pip install -e ".[tdx,reports]"
+```
+
+```python
+from astock_data import AStockDataClient
+
+client = AStockDataClient.from_defaults()
+quotes = client.get_realtime_quotes(["sh000001", "sz000001", "920982"])
+boards = client.get_board_fund_flow(board_type="industry", period="today", limit=300)
+monitor = client.get_stock_monitor(active_only=True)
+anomalies = client.get_price_anomalies()
+reports = client.get_stock_reports("600519.SH", max_pages=2)
+```
+
+The facade also covers TDX bars/quotes/transactions, industry reports, THS consensus EPS, Dragon Tiger seat aggregation, lockups, and announcements. Stock-specific methods use strict ticker validation; Eastmoney capabilities keep throttling, bounded retries, pagination metadata, and structured degradation. Missing optional extras affect only their related capability and return `unavailable` without breaking base-package imports.
+
 > Compatible with [Claude Code](https://github.com/anthropics/claude-code) · [Codex](https://github.com/openai/codex) · [OpenClaw](https://github.com/anthropics/openclaw)
 >
 > The Skill file is structured Markdown + embedded Python. Any AI coding assistant with context injection can use it.

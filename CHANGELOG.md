@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## Python package v0.2.0 — 2026-08-09
+
+### 新增
+- 新增严格 `normalize_ticker()` / `get_market_prefix()` 公共契约，个股 facade 统一拒绝截断代码、市场号段矛盾和显式沪市指数。
+- 新增 Tencent 实时行情 provider，支持同批沪深同号标的、北交所 920 路由、成交额/市值标准单位及僵尸报价标记。
+- 新增可选 mootdx provider 和 `[tdx]` extra，提供 K 线、行情快照与逐笔成交；非 `std` 市场不再错误执行 A 股样本验活。
+- 新增个股/行业研报、同花顺一致预期 EPS（`[reports]` extra）、龙虎榜席位与机构汇总、重点监控池、严重异常波动明细及统计 facade。
+
+### 变更与修复
+- 板块资金流 `limit` 扩展至 1..1000，内部按 200 条透明翻页；coverage 增加真实总数、页数、请求满足度和全量覆盖标记，后续页失败保留部分结果。
+- 监控有效窗口统一按北京时间判断，正确识别 Eastmoney `MARKET=B`；异动接口补齐 H5 固定参数、北交所识别和加严规则码。
+- 龙虎榜汇总在回看窗口无上榜记录时返回稳定空结构，席位查询失败时保留上榜记录并标记 `partial`。
+- package 版本升至 0.2.0；基础安装继续零第三方运行时依赖。
+
+## Python package v0.1.0 — 2026-07-15
 
 ### 新增
 - 新增 `src/astock_data/` Python package contract，公开 `AStockDataClient` facade、结构化 `ProviderResult`/`SourceMetadata`/`DataStatus`/`Money` 模型和 provider 注入边界。

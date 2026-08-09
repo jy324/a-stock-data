@@ -7,26 +7,210 @@ the injected provider objects.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
 from .models import DataStatus, ProviderResult, SourceMetadata
+from .tickers import normalize_ticker
 
 
 class AStockDataClient:
     """Facade consumed by DSA and other applications."""
 
-    def __init__(self, *, eastmoney_provider: Any = None, cninfo_provider: Any = None):
+    def __init__(
+        self,
+        *,
+        eastmoney_provider: Any = None,
+        cninfo_provider: Any = None,
+        tencent_provider: Any = None,
+        tdx_provider: Any = None,
+        ths_provider: Any = None,
+    ):
         self._eastmoney = eastmoney_provider
         self._cninfo = cninfo_provider
+        self._tencent = tencent_provider
+        self._tdx = tdx_provider
+        self._ths = ths_provider
 
     @classmethod
-    def from_defaults(cls) -> "AStockDataClient":
+    def from_defaults(cls) -> AStockDataClient:
         """Build a client with the package's built-in HTTP providers."""
         from .providers.cninfo import CninfoProvider
         from .providers.eastmoney import EastmoneyProvider
+        from .providers.tdx import TdxProvider
+        from .providers.tencent import TencentProvider
+        from .providers.ths import ThsProvider
 
-        return cls(eastmoney_provider=EastmoneyProvider(), cninfo_provider=CninfoProvider())
+        return cls(
+            eastmoney_provider=EastmoneyProvider(),
+            cninfo_provider=CninfoProvider(),
+            tencent_provider=TencentProvider(),
+            tdx_provider=TdxProvider(),
+            ths_provider=ThsProvider(),
+        )
+
+    def get_realtime_quotes(self, codes: Iterable[str]) -> ProviderResult[list[dict]]:
+        if isinstance(codes, (str, bytes)):
+            raise ValueError("codes must be an iterable of ticker strings")
+        requested = [str(code).strip() for code in codes]
+        if not requested:
+            raise ValueError("codes must contain at least one ticker")
+        for code in requested:
+            normalize_ticker(code)
+        result = self._call(
+            self._tencent,
+            "get_realtime_quotes",
+            capability="realtime_quotes",
+            trade_date=None,
+            codes=requested,
+        )
+        return _replace_result_data(
+            result,
+            _rows(result.data),
+            {"requested_count": len(requested)},
+        )
+
+    def get_tdx_bars(
+        self,
+        symbol: str,
+        *,
+        frequency: int = 9,
+        offset: int = 800,
+        market: str = "std",
+    ) -> ProviderResult[list[dict]]:
+        safe_symbol = _normalize_tdx_symbol(symbol, market)
+        if isinstance(frequency, bool) or not isinstance(frequency, int):
+            raise ValueError("frequency must be an integer")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+            raise ValueError("offset must be a positive integer")
+        result = self._call(
+            self._tdx,
+            "get_bars",
+            capability="tdx_bars",
+            trade_date=None,
+            symbol=safe_symbol,
+            frequency=frequency,
+            offset=offset,
+            market=market,
+        )
+        return _replace_result_data(result, _rows(result.data), {"market": market})
+
+    def get_tdx_quote(self, symbol: str, *, market: str = "std") -> ProviderResult[list[dict]]:
+        safe_symbol = _normalize_tdx_symbol(symbol, market)
+        result = self._call(
+            self._tdx,
+            "get_quote",
+            capability="tdx_quote",
+            trade_date=None,
+            symbol=safe_symbol,
+            market=market,
+        )
+        return _replace_result_data(result, _rows(result.data), {"market": market})
+
+    def get_tdx_transactions(
+        self,
+        symbol: str,
+        *,
+        trade_date: str,
+        market: str = "std",
+    ) -> ProviderResult[list[dict]]:
+        safe_symbol = _normalize_tdx_symbol(symbol, market)
+        date_text = str(trade_date)
+        if len(date_text) != 8 or not date_text.isdigit():
+            raise ValueError("trade_date must use YYYYMMDD")
+        result = self._call(
+            self._tdx,
+            "get_transactions",
+            capability="tdx_transactions",
+            trade_date=f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}",
+            symbol=safe_symbol,
+            date=date_text,
+            market=market,
+        )
+        return _replace_result_data(result, _rows(result.data), {"market": market})
+
+    def get_stock_reports(self, code: str, *, max_pages: int = 5) -> ProviderResult[list[dict]]:
+        normalized = normalize_ticker(code, stock_only=True)
+        safe_max_pages = _validate_bounded_positive_int(max_pages, "max_pages", 20)
+        result = self._call(
+            self._eastmoney,
+            "get_stock_reports",
+            capability="stock_reports",
+            trade_date=None,
+            code=normalized,
+            max_pages=safe_max_pages,
+        )
+        return _replace_result_data(
+            result,
+            _rows(result.data),
+            {"filtered_code": normalized, "requested_max_pages": safe_max_pages},
+        )
+
+    def get_industry_reports(
+        self,
+        *,
+        industry_code: str = "*",
+        begin_date: str | None = None,
+        max_pages: int = 5,
+    ) -> ProviderResult[list[dict]]:
+        safe_industry_code = str(industry_code or "").strip()
+        if not safe_industry_code:
+            raise ValueError("industry_code must not be empty")
+        safe_begin_date = _validate_iso_date(begin_date, "begin_date") if begin_date is not None else None
+        safe_max_pages = _validate_bounded_positive_int(max_pages, "max_pages", 20)
+        result = self._call(
+            self._eastmoney,
+            "get_industry_reports",
+            capability="industry_reports",
+            trade_date=None,
+            industry_code=safe_industry_code,
+            begin_date=safe_begin_date,
+            max_pages=safe_max_pages,
+        )
+        return _replace_result_data(
+            result,
+            _rows(result.data),
+            {"industry_code": safe_industry_code, "requested_max_pages": safe_max_pages},
+        )
+
+    def get_eps_forecast(self, code: str) -> ProviderResult[list[dict]]:
+        normalized = normalize_ticker(code, stock_only=True)
+        result = self._call(
+            self._ths,
+            "get_eps_forecast",
+            capability="eps_forecast",
+            trade_date=None,
+            code=normalized,
+        )
+        return _replace_result_data(result, _rows(result.data), {"filtered_code": normalized})
+
+    def get_stock_dragon_tiger_summary(
+        self,
+        code: str,
+        *,
+        trade_date: str,
+        lookback: int = 30,
+    ) -> ProviderResult[dict[str, Any]]:
+        normalized = normalize_ticker(code, stock_only=True)
+        safe_trade_date = _validate_iso_date(trade_date, "trade_date")
+        safe_lookback = _validate_bounded_positive_int(lookback, "lookback", 365)
+        result = self._call_with_provider_kwargs(
+            self._eastmoney,
+            "get_stock_dragon_tiger_summary",
+            capability="stock_dragon_tiger_summary",
+            trade_date=safe_trade_date,
+            provider_kwargs={
+                "code": normalized,
+                "trade_date": safe_trade_date,
+                "lookback": safe_lookback,
+            },
+        )
+        return _replace_result_data(
+            result,
+            result.data,
+            {"filtered_code": normalized, "lookback_days": safe_lookback},
+        )
 
     def get_stock_intraday_flow(self, code: str, *, trade_date: str | None = None) -> ProviderResult[list[dict]]:
         return self._call(
@@ -34,7 +218,7 @@ class AStockDataClient:
             "get_stock_intraday_flow",
             capability="stock_intraday_flow",
             trade_date=trade_date,
-            code=_normalize_code(code),
+            code=normalize_ticker(code, stock_only=True),
         )
 
     def get_stock_flow_history(
@@ -44,7 +228,7 @@ class AStockDataClient:
         trade_date: str | None = None,
         lookback: int = 120,
     ) -> ProviderResult[list[dict]]:
-        normalized = _normalize_code(code)
+        normalized = normalize_ticker(code, stock_only=True)
         result = self._call(
             self._eastmoney,
             "get_stock_flow_history",
@@ -114,6 +298,62 @@ class AStockDataClient:
             },
         )
 
+    def get_stock_monitor(self, *, active_only: bool = True) -> ProviderResult[list[dict]]:
+        if not isinstance(active_only, bool):
+            raise ValueError("active_only must be a boolean")
+        result = self._call(
+            self._eastmoney,
+            "get_stock_monitor",
+            capability="stock_monitor",
+            trade_date=None,
+            active_only=active_only,
+        )
+        return _replace_result_data(result, _rows(result.data), {"active_only": active_only})
+
+    def get_price_anomalies(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 200,
+    ) -> ProviderResult[list[dict]]:
+        safe_page = _validate_positive_int(page, "page")
+        safe_page_size = _validate_page_size(page_size)
+        result = self._call(
+            self._eastmoney,
+            "get_price_anomalies",
+            capability="price_anomalies",
+            trade_date=None,
+            page=safe_page,
+            page_size=safe_page_size,
+        )
+        return _replace_result_data(
+            result,
+            _rows(result.data),
+            {"page": safe_page, "page_size": safe_page_size},
+        )
+
+    def get_price_anomaly_counts(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> ProviderResult[list[dict]]:
+        safe_page = _validate_positive_int(page, "page")
+        safe_page_size = _validate_page_size(page_size)
+        result = self._call(
+            self._eastmoney,
+            "get_price_anomaly_counts",
+            capability="price_anomaly_counts",
+            trade_date=None,
+            page=safe_page,
+            page_size=safe_page_size,
+        )
+        return _replace_result_data(
+            result,
+            _rows(result.data),
+            {"page": safe_page, "page_size": safe_page_size},
+        )
+
     def get_market_dragon_tiger(
         self,
         *,
@@ -133,7 +373,7 @@ class AStockDataClient:
         return _replace_result_data(result, rows)
 
     def get_stock_dragon_tiger(self, code: str, *, trade_date: str | None = None) -> ProviderResult[list[dict]]:
-        normalized = _normalize_code(code)
+        normalized = normalize_ticker(code, stock_only=True)
         result = self._call(
             self._eastmoney,
             "get_stock_dragon_tiger",
@@ -151,7 +391,7 @@ class AStockDataClient:
         end_date: str | None = None,
         limit: int = 30,
     ) -> ProviderResult[list[dict]]:
-        normalized = _normalize_code(code)
+        normalized = normalize_ticker(code, stock_only=True)
         result = self._call(
             self._cninfo,
             "get_announcements",
@@ -172,7 +412,7 @@ class AStockDataClient:
         forward_days: int = 90,
         limit: int | None = None,
     ) -> ProviderResult[list[dict]]:
-        normalized = _normalize_code(code)
+        normalized = normalize_ticker(code, stock_only=True)
         result = self._call(
             self._eastmoney,
             "get_lockup_events",
@@ -188,12 +428,29 @@ class AStockDataClient:
         return _replace_result_data(result, rows, {"filtered_code": normalized})
 
     def _call(self, provider: Any, method_name: str, *, capability: str, trade_date: str | None, **kwargs: Any):
+        return self._call_with_provider_kwargs(
+            provider,
+            method_name,
+            capability=capability,
+            trade_date=trade_date,
+            provider_kwargs=kwargs,
+        )
+
+    def _call_with_provider_kwargs(
+        self,
+        provider: Any,
+        method_name: str,
+        *,
+        capability: str,
+        trade_date: str | None,
+        provider_kwargs: dict[str, Any],
+    ):
         if provider is None:
             return _unavailable_result(capability, trade_date, "provider is not configured")
         method = getattr(provider, method_name, None)
         if method is None:
             return _unavailable_result(capability, trade_date, f"provider method missing: {method_name}")
-        raw = method(**kwargs)
+        raw = method(**provider_kwargs)
         return _coerce_result(raw, capability=capability, trade_date=trade_date)
 
 
@@ -256,15 +513,6 @@ def _replace_result_data(
     return ProviderResult(data=data, meta=result.meta, coverage=coverage)
 
 
-def _normalize_code(code: str) -> str:
-    text = str(code or "").strip().upper()
-    if text.startswith(("SH", "SZ", "BJ")) and len(text) >= 8:
-        return text[2:]
-    if "." in text:
-        return text.split(".", 1)[0]
-    return text
-
-
 def _rows(data: Any) -> list[dict]:
     if isinstance(data, list):
         return [row for row in data if isinstance(row, dict)]
@@ -294,7 +542,10 @@ def _row_code(row: dict) -> str | None:
     for key in ("code", "stock_code", "security_code", "SECURITY_CODE", "股票代码"):
         value = row.get(key)
         if value not in (None, ""):
-            return _normalize_code(str(value))
+            try:
+                return normalize_ticker(str(value))
+            except ValueError:
+                return None
     return None
 
 
@@ -318,9 +569,48 @@ def _validate_board_fund_flow_period(value: Any) -> str:
 
 
 def _validate_board_fund_flow_limit(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
-        raise ValueError("limit must be an integer between 1 and 100")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+        raise ValueError("limit must be an integer between 1 and 1000")
     return value
+
+
+def _validate_positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validate_page_size(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 200:
+        raise ValueError("page_size must be an integer between 1 and 200")
+    return value
+
+
+def _normalize_tdx_symbol(symbol: str, market: str) -> str:
+    if not isinstance(market, str) or not market.strip():
+        raise ValueError("market must be a non-empty string")
+    if market == "std":
+        return normalize_ticker(symbol, stock_only=True)
+    text = str(symbol).strip()
+    if not text:
+        raise ValueError("symbol must not be empty")
+    return text
+
+
+def _validate_bounded_positive_int(value: Any, name: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between 1 and {maximum}")
+    return value
+
+
+def _validate_iso_date(value: Any, name: str) -> str:
+    text = str(value or "")
+    if len(text) != 10 or text[4:5] != "-" or text[7:8] != "-":
+        raise ValueError(f"{name} must use YYYY-MM-DD")
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{name} must use YYYY-MM-DD") from exc
 
 
 def _clip_rows_by_lookback(rows: list[dict], lookback: int) -> list[dict]:

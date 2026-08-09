@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from urllib.parse import parse_qs, urlparse
+import json
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -39,7 +40,7 @@ def _board_response_for_query(
         if (
             query.get("fs") == [fs]
             and query.get("fid") == [fid]
-            and query.get("pz") == [str(limit)]
+            and query.get("pz") == ["200"]
             and requested_fields == fields
         ):
             return FakeResponse(payload)
@@ -171,6 +172,10 @@ def test_board_fund_flow_normalizes_today_rows_and_current_snapshot_metadata():
         "returned_count": 1,
         "board_type": "industry",
         "period": "today",
+        "upstream_total": 1,
+        "pages_fetched": 1,
+        "requested_limit_satisfied": True,
+        "is_full_universe": True,
     }
 
 
@@ -290,7 +295,7 @@ def test_board_fund_flow_normalizes_ten_day_rows_without_leader_or_size_buckets(
         ({"board_type": "theme"}, "board_type"),
         ({"period": "3d"}, "period"),
         ({"limit": 0}, "limit"),
-        ({"limit": 101}, "limit"),
+        ({"limit": 1001}, "limit"),
         ({"limit": "20"}, "limit"),
     ],
 )
@@ -316,6 +321,10 @@ def test_board_fund_flow_returns_empty_for_an_empty_upstream_list():
         "returned_count": 0,
         "board_type": "concept",
         "period": "5d",
+        "upstream_total": 0,
+        "pages_fetched": 1,
+        "requested_limit_satisfied": True,
+        "is_full_universe": True,
     }
 
 
@@ -445,6 +454,10 @@ def test_board_fund_flow_returns_structured_unavailable_for_transport_errors():
         "returned_count": 0,
         "board_type": "region",
         "period": "10d",
+        "upstream_total": None,
+        "pages_fetched": 0,
+        "requested_limit_satisfied": False,
+        "is_full_universe": False,
     }
 
 
@@ -591,3 +604,55 @@ def test_retry_exhaustion_returns_structured_unavailable():
     assert result.data == []
     assert "HTTP Error 503" in result.meta.warnings[0]
     assert mocked_urlopen.call_count == 3
+
+
+def test_board_fund_flow_transparently_fetches_more_than_one_page_and_reports_total():
+    first_page = [
+        {
+            "f12": f"BK{index:04d}",
+            "f14": f"板块{index}",
+            "f62": 1000 - index,
+            "f184": 1.0,
+            "f3": 0.5,
+            "f204": "领涨股",
+            "f66": 1,
+            "f72": 2,
+            "f78": 3,
+            "f84": 4,
+        }
+        for index in range(1, 201)
+    ]
+    second_page = [
+        {
+            "f12": "BK0201",
+            "f14": "板块201",
+            "f62": 799,
+            "f184": 1.0,
+            "f3": 0.5,
+            "f204": "领涨股",
+            "f66": 1,
+            "f72": 2,
+            "f78": 3,
+            "f84": 4,
+        }
+    ]
+
+    def open_page(request, *, timeout):
+        query = parse_qs(urlparse(request.full_url).query)
+        assert query["pz"] == ["200"]
+        page = query["pn"][0]
+        rows = first_page if page == "1" else second_page
+        return FakeResponse(json.dumps({"data": {"total": 201, "diff": rows}}))
+
+    provider = EastmoneyProvider(min_interval=0)
+    with patch("astock_data.providers.eastmoney.urlopen", side_effect=open_page):
+        result = provider.get_board_fund_flow(limit=201)
+
+    assert result.status == "ok"
+    assert len(result.data) == 201
+    assert result.data[-1]["rank"] == 201
+    assert result.data[-1]["provider_board_code"] == "BK0201"
+    assert result.coverage["upstream_total"] == 201
+    assert result.coverage["pages_fetched"] == 2
+    assert result.coverage["requested_limit_satisfied"] is True
+    assert result.coverage["is_full_universe"] is True
